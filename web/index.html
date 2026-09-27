@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VR Duck Fetch</title>
+<style>
+  :root { --bg:#0f1720; --panel:rgba(15,23,32,.82); --text:#e6edf3; --muted:#8b98a5; --accent:#ff7a2f; --ok:#3fb950; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font:14px/1.4 system-ui,sans-serif; overflow:hidden; }
+  #hud { position:fixed; top:12px; left:12px; width:300px; background:var(--panel); border-radius:10px; padding:12px 14px; backdrop-filter:blur(6px); }
+  #hud h1 { font-size:15px; margin:0 0 6px; }
+  .row { display:flex; justify-content:space-between; gap:8px; margin:3px 0; }
+  .muted { color:var(--muted); }
+  .pill { padding:1px 8px; border-radius:999px; background:#233040; font-weight:600; }
+  .pill.held{background:#1f3a24;color:var(--ok)} .pill.flying,.pill.ground{background:#3a2a1a;color:var(--accent)} .pill.carried{background:#1b2d45;color:#79c0ff}
+  #log { margin-top:8px; font:12px ui-monospace,monospace; color:var(--muted); max-height:110px; overflow:auto; }
+  label { display:flex; align-items:center; gap:8px; margin-top:6px; }
+  input[type=range]{ flex:1; }
+  button { margin-top:8px; background:#233040; color:var(--text); border:1px solid #33475b; border-radius:6px; padding:5px 10px; cursor:pointer; }
+  #help { position:fixed; bottom:12px; left:12px; background:var(--panel); border-radius:8px; padding:8px 12px; color:var(--muted); font-size:12.5px; }
+  #xrOverlay { position:fixed; z-index:1000; left:50%; top:16px; transform:translateX(-50%); background:var(--panel); border-radius:10px; padding:8px 14px; font-size:13px; text-align:center; max-width:calc(100% - 32px); }
+  #xrOverlay .bar { height:6px; background:#233040; border-radius:3px; margin:6px 0 4px; overflow:hidden; }
+  #power { height:100%; width:0; background:var(--accent); }
+  #xrStatus { color:var(--muted); font-size:12px; }
+  #conn { position:fixed; top:12px; right:12px; background:var(--panel); border-radius:8px; padding:6px 10px; font-size:12px; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>🦆 Duck swarm fetch</h1>
+  <div class="row"><span class="muted">Ball</span><span id="ballState" class="pill">…</span></div>
+  <div class="row"><span class="muted">Fetcher</span><span id="fetcher">—</span></div>
+  <div class="row"><span class="muted">Sim time</span><span id="simT">0.0 s</span></div>
+  <div class="row"><span class="muted">Render</span><span id="fps">– fps</span></div>
+  <label><span class="muted">Speed</span><input id="speed" type="range" min="0.5" max="4" step="0.5" value="2"><span id="speedV">2×</span></label>
+  <label><input id="escort" type="checkbox" checked> Swarm escorts the fetcher</label>
+  <button id="reset">Reset</button>
+  <div id="log"></div>
+</div>
+<div id="help"><b>Click floor</b>: throw the ball there · <b>Shift+click</b>: move yourself · drag: orbit · wheel: zoom · <b>Enter VR</b> (bottom): first-person on an emulated Quest 3 — no headset needed</div>
+<div id="conn">connecting…</div>
+<div id="xrOverlay" hidden>
+  <div><b>Emulated Quest 3</b> · click to capture mouse · <b>mouse</b> look · <b>WASD</b> walk ·
+  <b>hold click</b> wind up, <b>release</b> throw · <b>X</b> exit VR</div>
+  <div class="bar"><div id="power"></div></div>
+  <div id="xrStatus"></div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+               "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { XRDevice, metaQuest3 } from 'https://unpkg.com/iwer@2.5.0/build/iwer.module.js';
+
+// No headset? Emulate a Quest 3 in the page (Meta's IWER). ?native uses a real headset instead.
+let xrDevice = null;
+if (!new URLSearchParams(location.search).has('native')) {
+  xrDevice = new XRDevice(metaQuest3);
+  xrDevice.installRuntime({ forceInstall: true });
+  xrDevice.stereoEnabled = false;
+}
+
+// ---------- three.js setup (y-up) ; sim world is z-up, mapped via `world` group ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+// ?lite: no shadows + half resolution, for slow GPUs / software rendering
+const LITE = new URLSearchParams(location.search).has('lite');
+renderer.setPixelRatio(LITE ? 0.5 : devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = !LITE;
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1d2a38);
+scene.fog = new THREE.Fog(0x1d2a38, 6, 14);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.01, 50);
+camera.position.set(-2.0, 1.6, 1.6);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0.3, 0.1, 0);
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xdde8ff, 0x2a2a35, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(2, 4, 1.5); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -3, right: 3, top: 3, bottom: -3 });
+scene.add(sun);
+
+// sky dome: scene.background isn't drawn in the (emulated) XR session, so use real geometry
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(40, 32, 16),
+  new THREE.MeshBasicMaterial({ color: 0x1d2a38, side: THREE.BackSide, fog: false })));
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), new THREE.MeshStandardMaterial({ color: 0x2b3b4d, roughness: 0.9 }));
+floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; scene.add(floor);
+const grid = new THREE.GridHelper(30, 120, 0x46607a, 0x34495e); grid.position.y = 0.001; scene.add(grid);
+
+const world = new THREE.Group();            // sim frame: (x, y, z_up) -> three (x, z, -y)
+world.rotation.x = -Math.PI / 2;
+scene.add(world);
+const sim2three = (p) => new THREE.Vector3(p[0], p[2] ?? 0, -p[1]);
+const three2sim = (v) => [v.x, -v.z, v.y];
+
+// markers
+const ring = (r, color) => { const m = new THREE.Mesh(new THREE.RingGeometry(r * 0.8, r, 40), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.85, side: THREE.DoubleSide })); m.rotation.x = -Math.PI / 2; m.position.y = 0.003; m.visible = false; scene.add(m); return m; };
+const landingMark = ring(0.09, 0xff7a2f);
+const fetcherMark = ring(0.13, 0x79c0ff);
+
+// user avatar (only on desktop; in VR you ARE the user)
+const avatar = new THREE.Group();
+const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.9, 6, 16), new THREE.MeshStandardMaterial({ color: 0x8aa4bf, transparent: true, opacity: 0.55 }));
+body.position.y = 0.62; avatar.add(body);
+const headM = new THREE.Mesh(new THREE.SphereGeometry(0.12, 20, 16), body.material); headM.position.y = 1.35; avatar.add(headM);
+const nose = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.14, 12), new THREE.MeshStandardMaterial({ color: 0xffd166 }));
+nose.rotation.z = -Math.PI / 2; nose.position.set(0.15, 1.35, 0); avatar.add(nose);
+scene.add(avatar);
+
+// ---------- scene from server ----------
+let bodies = [];
+function buildScene(desc) {
+  world.clear(); bodies = [];
+  const geoCache = {};
+  for (const [name, m] of Object.entries(desc.meshes)) {
+    const g = new THREE.BufferGeometry();
+    const bytes = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(bytes(m.vert)), 3));
+    g.setIndex(new THREE.BufferAttribute(new Uint32Array(bytes(m.face)), 1));
+    g.computeVertexNormals();
+    geoCache[name] = g;
+  }
+  for (let b = 0; b < desc.nbody; b++) { const grp = new THREE.Group(); grp.matrixAutoUpdate = true; world.add(grp); bodies.push(grp); }
+  const matCache = {};
+  for (const g of desc.geoms) {
+    let geo;
+    const s = g.size;
+    switch (g.type) {
+      case 7: geo = geoCache[g.mesh]; break;                                         // mesh
+      case 2: geo = new THREE.SphereGeometry(s[0], 24, 16); break;                    // sphere
+      case 3: geo = new THREE.CapsuleGeometry(s[0], 2 * s[1], 6, 12).rotateX(Math.PI / 2); break;
+      case 5: geo = new THREE.CylinderGeometry(s[0], s[0], 2 * s[1], 20).rotateX(Math.PI / 2); break;
+      case 6: geo = new THREE.BoxGeometry(2 * s[0], 2 * s[1], 2 * s[2]); break;
+      case 4: geo = new THREE.SphereGeometry(1, 20, 14).scale(s[0], s[1], s[2]); break;
+      default: continue;
+    }
+    const key = g.rgba.join(',');
+    const mat = matCache[key] ??= new THREE.MeshStandardMaterial({ color: new THREE.Color(g.rgba[0], g.rgba[1], g.rgba[2]), roughness: 0.55, metalness: 0.05, transparent: g.rgba[3] < 1, opacity: g.rgba[3] });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true;
+    mesh.position.set(...g.pos);
+    mesh.quaternion.set(g.quat[1], g.quat[2], g.quat[3], g.quat[0]);
+    bodies[g.body].add(mesh);
+  }
+}
+
+function applyPoses(buf) {
+  const a = new Float32Array(buf);
+  for (let b = 0; b < bodies.length; b++) {
+    const o = b * 7;
+    bodies[b].position.set(a[o], a[o + 1], a[o + 2]);
+    bodies[b].quaternion.set(a[o + 4], a[o + 5], a[o + 6], a[o + 3]);
+  }
+}
+
+// ---------- HUD ----------
+const $ = (id) => document.getElementById(id);
+let last = null;
+function applyState(s) {
+  last = s;
+  $('ballState').textContent = s.ball_state; $('ballState').className = 'pill ' + s.ball_state;
+  $('fetcher').textContent = s.fetcher === null ? '—' : `duck ${s.fetcher}`;
+  $('simT').textContent = s.t.toFixed(1) + ' s';
+  $('log').innerHTML = s.events.map(e => `<div>• ${e}</div>`).join('');
+  if (s.landing && s.ball_state !== 'held' && s.ball_state !== 'carried') { landingMark.visible = true; landingMark.position.copy(sim2three(s.landing)).setY(0.003); } else landingMark.visible = false;
+  if (s.fetcher !== null) { fetcherMark.visible = true; fetcherMark.position.copy(sim2three(s.ducks[s.fetcher].pos)).setY(0.004); } else fetcherMark.visible = false;
+  if (!renderer.xr.isPresenting) { avatar.position.copy(sim2three(s.user)); avatar.rotation.y = s.user_yaw; }
+}
+
+// ---------- networking ----------
+let ws;
+function connect() {
+  ws = new WebSocket(`ws://${location.hostname || 'localhost'}:8765`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { $('conn').textContent = '● connected'; $('conn').style.color = '#3fb950'; };
+  ws.onclose = () => { $('conn').textContent = '○ disconnected — retrying'; $('conn').style.color = '#f85149'; setTimeout(connect, 1000); };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== 'string') return applyPoses(ev.data);
+    const m = JSON.parse(ev.data);
+    if (m.type === 'scene') buildScene(m); else if (m.type === 'state') applyState(m);
+  };
+}
+connect();
+const send = (m) => ws && ws.readyState === 1 && ws.send(JSON.stringify(m));
+
+$('speed').oninput = (e) => { $('speedV').textContent = e.target.value + '×'; send({ type: 'config', time_scale: +e.target.value }); };
+$('escort').onchange = (e) => send({ type: 'config', escort: e.target.checked });
+$('reset').onclick = () => send({ type: 'reset' });
+
+// desktop: click floor = throw there, shift+click = move user (facing the ducks)
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+let downAt = null;
+renderer.domElement.addEventListener('pointerdown', (e) => downAt = [e.clientX, e.clientY]);
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return; // was an orbit drag
+  mouse.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(mouse, camera);
+  const hit = ray.intersectObject(floor)[0];
+  if (!hit) return;
+  const p = three2sim(hit.point);
+  if (e.shiftKey) {
+    const c = last ? last.ducks.reduce((a, d) => [a[0] + d.pos[0] / last.ducks.length, a[1] + d.pos[1] / last.ducks.length], [0, 0]) : [0, 0];
+    send({ type: 'user', pos: [p[0], p[1]], yaw: Math.atan2(c[1] - p[1], c[0] - p[0]) });
+  } else send({ type: 'throw_to', target: [p[0], p[1]] });
+});
+
+// ---------- WebXR: you are the user; trigger = grab, release = throw with hand velocity ----------
+// Same code runs on a real headset and on the emulated Quest below.
+const handGeo = new THREE.SphereGeometry(0.035, 16, 12);
+const hands = [0, 1].map((i) => {
+  const c = renderer.xr.getController(i);
+  c.add(new THREE.Mesh(handGeo, new THREE.MeshStandardMaterial({ color: 0xffd8b0 })));
+  c.userData = { hist: [], grabbing: false };
+  c.addEventListener('selectstart', () => { c.userData.grabbing = true; c.userData.hist.length = 0; });
+  c.addEventListener('selectend', () => {
+    const { hist } = c.userData;
+    if (!c.userData.grabbing || hist.length < 2) return;
+    c.userData.grabbing = false;
+    // release velocity from the last ~100 ms of hand motion (>= 2 samples, so it
+    // still works at low frame rates); older samples include the wind-up pause
+    const b = hist[hist.length - 1];
+    const recent = hist.filter((h) => b.t - h.t <= 100);
+    const a = recent.length >= 2 ? recent[0] : hist[hist.length - 2], dt = (b.t - a.t) / 1000;
+    const v = b.p.clone().sub(a.p).divideScalar(Math.max(dt, 1e-3));
+    send({ type: 'throw', pos: three2sim(b.p), vel: three2sim(v) });
+  });
+  scene.add(c);
+  return c;
+});
+renderer.xr.addEventListener('sessionstart', () => { avatar.visible = false; $('xrOverlay').hidden = !xrDevice; });
+renderer.xr.addEventListener('sessionend', () => { avatar.visible = true; $('xrOverlay').hidden = true; send({ type: 'hand', pos: null }); });
+
+// ---------- emulated Quest 3 (IWER): drive headset + right controller from mouse/keyboard ----------
+const emu = { yaw: -Math.PI / 2 + 0.45, pitch: -0.5,   // start facing the field, ducks parked front-left
+              pos: new THREE.Vector3(-0.7, 1.6, 0), keys: new Set(),
+              charging: false, chargeT0: 0, swing: null, power: 0 };
+const REST = new THREE.Vector3(0.18, -0.32, -0.35);    // hand offset in head frame
+const BACK = new THREE.Vector3(0.22, -0.12, 0.05);     // wound up behind the shoulder
+const FRONT = new THREE.Vector3(0.12, -0.02, -0.65);   // end of the swing
+addEventListener('keydown', (e) => {
+  emu.keys.add(e.code);
+  if (e.code === 'KeyX' && renderer.xr.isPresenting) renderer.xr.getSession().end();
+});
+addEventListener('keyup', (e) => emu.keys.delete(e.code));
+addEventListener('mousemove', (e) => {
+  if (!xrDevice || !renderer.xr.isPresenting || !document.pointerLockElement) return;
+  emu.yaw -= e.movementX * 0.0025;
+  emu.pitch = Math.max(-1.3, Math.min(1.3, emu.pitch - e.movementY * 0.0025));
+});
+addEventListener('mousedown', (e) => {
+  if (!xrDevice || !renderer.xr.isPresenting || e.button !== 0) return;
+  if (!document.pointerLockElement) return renderer.domElement.requestPointerLock();
+  if (emu.swing) return;
+  emu.charging = true; emu.chargeT0 = performance.now();
+  xrDevice.controllers.right.updateButtonValue('trigger', 1);     // grab
+});
+addEventListener('mouseup', (e) => {
+  if (!emu.charging || e.button !== 0) return;
+  emu.charging = false;
+  // longer hold = faster swing: ~1.5 m/s (short hold) to ~6 m/s (1 s hold) hand speed
+  const dur = 0.12 + 0.36 * (1 - emu.power);
+  // The VR code measures release velocity from rendered frames, so the swing must span
+  // several frames. At low frame rates stretch it in time at the SAME hand speed (the
+  // hand just travels further), so throw strength doesn't depend on the frame rate.
+  const eff = Math.max(dur, 5 * (emu.frameDt ?? 0));
+  const end = BACK.clone().add(FRONT.clone().sub(BACK).multiplyScalar(eff / dur));
+  emu.swing = { t0: performance.now(), dur: eff, end };
+});
+
+function updateEmulator(dt) {
+  // slowest of the last ~20 frames: sizing the swing on a lucky fast frame breaks it
+  (emu.dts ??= []).push(dt); if (emu.dts.length > 20) emu.dts.shift();
+  emu.frameDt = Math.max(...emu.dts);
+  const qHead = new THREE.Quaternion().setFromEuler(new THREE.Euler(emu.pitch, emu.yaw, 0, 'YXZ'));
+  const fwd = new THREE.Vector3(-Math.sin(emu.yaw), 0, -Math.cos(emu.yaw));
+  const right = new THREE.Vector3(-fwd.z, 0, fwd.x);
+  const mv = new THREE.Vector3();
+  if (emu.keys.has('KeyW')) mv.add(fwd); if (emu.keys.has('KeyS')) mv.sub(fwd);
+  if (emu.keys.has('KeyD')) mv.add(right); if (emu.keys.has('KeyA')) mv.sub(right);
+  if (mv.lengthSq()) emu.pos.addScaledVector(mv.normalize(), 1.2 * Math.min(dt, 0.1));
+  xrDevice.position.set(emu.pos.x, emu.pos.y, emu.pos.z);
+  xrDevice.quaternion.set(qHead.x, qHead.y, qHead.z, qHead.w);
+
+  let off = REST;
+  if (emu.charging) {
+    emu.power = Math.min(1, (performance.now() - emu.chargeT0) / 1000);
+    off = REST.clone().lerp(BACK, Math.min(1, emu.power * 3));
+  } else if (emu.swing) {
+    const el = (performance.now() - emu.swing.t0) / 1000;
+    off = BACK.clone().lerp(emu.swing.end, Math.min(el / emu.swing.dur, 1));
+    if (el >= emu.swing.dur && !emu.swing.released) {          // let go at the end of the swing
+      xrDevice.controllers.right.updateButtonValue('trigger', 0);
+      emu.swing.released = true; emu.power = 0;
+    }
+    // follow-through: hold the hand out front for a moment so the release velocity
+    // is measured on the swing, not on the hand returning to rest
+    if (el >= emu.swing.dur + 0.3) emu.swing = null;
+  }
+  const hp = off.clone().applyQuaternion(qHead).add(emu.pos);
+  xrDevice.controllers.right.position.set(hp.x, hp.y, hp.z);
+  xrDevice.controllers.right.quaternion.set(qHead.x, qHead.y, qHead.z, qHead.w);
+  const lp = new THREE.Vector3(-REST.x, REST.y, REST.z).applyQuaternion(qHead).add(emu.pos);  // idle left hand
+  xrDevice.controllers.left.position.set(lp.x, lp.y, lp.z);
+  xrDevice.controllers.left.quaternion.set(qHead.x, qHead.y, qHead.z, qHead.w);
+  $('power').style.width = (emu.power * 100).toFixed(0) + '%';
+}
+
+// test hook: scripted wind-up + throw without pointer lock (used by automated checks)
+window.__emuThrow = (holdMs = 600) => {
+  emu.charging = true; emu.chargeT0 = performance.now();
+  xrDevice.controllers.right.updateButtonValue('trigger', 1);
+  setTimeout(() => dispatchEvent(new MouseEvent('mouseup', { button: 0 })), holdMs);
+};
+window.__emu = emu;
+
+let lastUserSend = 0, lastT = 0, fpsN = 0, fpsT = 0;
+renderer.setAnimationLoop((t) => {
+  const rawDt = (t - lastT) / 1000; lastT = t;
+  fpsN++; if (t - fpsT > 1000) { $('fps').textContent = (fpsN * 1000 / (t - fpsT)).toFixed(0) + ' fps'; fpsN = 0; fpsT = t; }
+  if (renderer.xr.isPresenting) {
+    if (xrDevice) updateEmulator(Math.min(rawDt, 1.0));
+    for (const c of hands) {
+      const p = new THREE.Vector3().setFromMatrixPosition(c.matrixWorld);
+      c.userData.hist.push({ p, t }); while (c.userData.hist.length > 6) c.userData.hist.shift();
+    }
+    if (t - lastUserSend > 50) {            // 20 Hz: head = delivery point, hand = where the held ball sits
+      lastUserSend = t;
+      const cam = renderer.xr.getCamera();
+      const hp = three2sim(new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld));
+      const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+      send({ type: 'user', pos: [hp[0], hp[1]], yaw: Math.atan2(-dir.z, dir.x) });
+      const holder = hands.find((c) => c.userData.grabbing) ?? hands[xrDevice ? 1 : 0];
+      const hand = three2sim(new THREE.Vector3().setFromMatrixPosition(holder.matrixWorld));
+      send({ type: 'hand', pos: hand });
+      if (last) $('xrStatus').textContent = `ball: ${last.ball_state}` + (last.fetcher !== null ? ` · duck ${last.fetcher}` : '');
+    }
+  }
+  controls.update();
+  renderer.render(scene, camera);
+});
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+</script>
+</body>
+</html>
